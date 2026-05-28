@@ -13,29 +13,15 @@
 # limitations under the License.
 
 
+import math
 import os
 from collections import defaultdict
-
-# diff_gaussian_rasterization is the legacy reference rasterizer.
-# Consider replacing with gsplat (https://github.com/nerfstudio-project/gsplat),
-# which is more maintained. The import is optional; forward_single_batch
-# returns placeholder zeros when no rasterizer is available, so downstream
-# code that only consumes the canonical gaussian splat attributes still works.
-GaussianRasterizationSettings = None
-GaussianRasterizer = None
-try:
-    from diff_gaussian_rasterization_wda import GaussianRasterizationSettings, GaussianRasterizer
-except ImportError:
-    try:
-        from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-    except ImportError:
-        pass
-import math
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from gsplat import rasterization as _gsplat_rasterization
 from pytorch3d.transforms import matrix_to_quaternion
 from torch import nn
 
@@ -527,93 +513,66 @@ class GS3DRenderer(nn.Module):
         viewpoint_camera: Camera,
         background_color: Optional[Float[Tensor, "3"]],
     ):
-        # Rasterizer is optional. When not available, return placeholder zero
-        # tensors. Callers that only consume the canonical gaussian splat
-        # attributes (gs_list) are unaffected.
-        if GaussianRasterizationSettings is None or GaussianRasterizer is None:
-            h, w = int(viewpoint_camera.height), int(viewpoint_camera.width)
-            return {
-                "comp_rgb": torch.zeros((h, w, 3), dtype=torch.float32, device=self.device),
-                "comp_mask": torch.zeros((h, w, 1), dtype=torch.float32, device=self.device),
-                "comp_depth": torch.zeros((h, w, 1), dtype=torch.float32, device=self.device),
-            }
+        h, w = int(viewpoint_camera.height), int(viewpoint_camera.width)
 
-        # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-        screenspace_points = torch.zeros_like(gs.xyz, dtype=gs.xyz.dtype, requires_grad=True, device=self.device) + 0
-        try:
-            screenspace_points.retain_grad()
-        except:
-            pass
-
-        bg_color = background_color
-        # Set up rasterization configuration
+        # Build intrinsic matrix K from FoV.
         tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
         tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-        GSRSettings = GaussianRasterizationSettings
-        GSR = GaussianRasterizer
-
-        raster_settings = GSRSettings(
-            image_height=int(viewpoint_camera.height),
-            image_width=int(viewpoint_camera.width),
-            tanfovx=tanfovx,
-            tanfovy=tanfovy,
-            bg=bg_color,
-            scale_modifier=self.scaling_modifier,
-            viewmatrix=viewpoint_camera.world_view_transform,
-            projmatrix=viewpoint_camera.full_proj_transform.float(),
-            sh_degree=self.sh_degree,
-            campos=viewpoint_camera.camera_center,
-            prefiltered=False,
-            debug=False,
+        fx = w / (2.0 * tanfovx)
+        fy = h / (2.0 * tanfovy)
+        K = torch.tensor(
+            [[fx, 0.0, w / 2.0], [0.0, fy, h / 2.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float32,
+            device=self.device,
         )
 
-        rasterizer = GSR(raster_settings=raster_settings)
+        # LAM's world_view_transform is stored as a column-major (transposed)
+        # view matrix; gsplat expects the standard row-major world-to-camera.
+        viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).float()
 
-        means3D = gs.xyz
-        means2D = screenspace_points
-        opacity = gs.opacity
+        means = gs.xyz.float()
+        quats = gs.rotation.float()  # LAM uses wxyz convention, gsplat default
+        scales = (gs.scaling * self.scaling_modifier).float()
+        opacities = gs.opacity.float().squeeze(-1)
 
-        # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-        # scaling / rotation by the rasterizer.
-        scales = None
-        rotations = None
-        cov3D_precomp = None
-        scales = gs.scaling
-        rotations = gs.rotation
-
-        # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
-        # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-        shs = None
-        colors_precomp = None
         if self.gs_net.use_rgb:
-            colors_precomp = gs.shs.squeeze(1)
+            # Precomputed colors: [N, 3]
+            colors = gs.shs.squeeze(1).float()
+            sh_degree = None
         else:
-            shs = gs.shs
-        # Rasterize visible Gaussians to image, obtain their radii (on screen).
-        # torch.cuda.synchronize()
-        # with boxx.timeit():
+            # SH coefficients: gsplat wants [N, K, 3] with K = (deg+1)^2
+            colors = gs.shs.float()
+            sh_degree = self.sh_degree
+
+        bg = background_color.float().unsqueeze(0) if background_color is not None else None
+
         with torch.autocast(device_type=self.device.type, dtype=torch.float32):
-            raster_ret = rasterizer(
-                means3D=means3D.float(),
-                means2D=means2D.float(),
-                shs=shs.float() if not self.gs_net.use_rgb else None,
-                colors_precomp=colors_precomp.float() if colors_precomp is not None else None,
-                opacities=opacity.float(),
-                scales=scales.float(),
-                rotations=rotations.float(),
-                cov3D_precomp=cov3D_precomp,
+            rendered, alphas, _info = _gsplat_rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=viewmat.unsqueeze(0),
+                Ks=K.unsqueeze(0),
+                width=w,
+                height=h,
+                sh_degree=sh_degree,
+                backgrounds=bg,
+                render_mode="RGB+ED",
             )
-        rendered_image, radii, rendered_depth, rendered_alpha = raster_ret
 
-        ret = {
-            "comp_rgb": rendered_image.permute(1, 2, 0),  # [H, W, 3]
-            "comp_rgb_bg": bg_color,
-            "comp_mask": rendered_alpha.permute(1, 2, 0),
-            "comp_depth": rendered_depth.permute(1, 2, 0),
+        # rendered: [1, H, W, 4] (RGB+depth). alphas: [1, H, W, 1].
+        rgb = rendered[0, ..., :3]
+        depth = rendered[0, ..., 3:4]
+        alpha = alphas[0]
+
+        return {
+            "comp_rgb": rgb,
+            "comp_rgb_bg": background_color,
+            "comp_mask": alpha,
+            "comp_depth": depth,
         }
-
-        return ret
 
     def animate_gs_model(self, gs_attr: GaussianModel, query_points, flame_data, debug=False):
         """query_points: [N, 3]"""
